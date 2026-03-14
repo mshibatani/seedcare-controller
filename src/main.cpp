@@ -6,15 +6,17 @@
 
   Author: Masayuki Shibatani
   Date:   2022/4/4
-  Modified (Claude Code Opus 4.6): 2026/3/2 - Non-blocking redesign + checkpoint logging + watchdog timer
+  Modified (Claude Code Opus 4.6): 2026/3/2 - Non-blocking redesign + checkpoint
+logging + watchdog timer
 *********/
 
-#include <Arduino.h>
-#include <time.h>
-#include <WiFi.h>
-#include <SPIFFS.h>
-#include <esp_task_wdt.h>
 #include "config.h"
+#include <Arduino.h>
+#include <Preferences.h>
+#include <SPIFFS.h>
+#include <WiFi.h>
+#include <esp_task_wdt.h>
+#include <time.h>
 
 // ===== Common =====
 #define MAX_MESSAGELENGTH 256
@@ -22,17 +24,17 @@
 
 // ===== Checkpoint Logging =====
 // RTC memory survives soft reboot, SPIFFS survives power loss
-#define CP_LOOP_START  0x01
-#define CP_TEMP_BEGIN  0x10
-#define CP_TEMP_END    0x11
+#define CP_LOOP_START 0x01
+#define CP_TEMP_BEGIN 0x10
+#define CP_TEMP_END 0x11
 #define CP_RELAY_BEGIN 0x20
-#define CP_RELAY_END   0x21
-#define CP_WIFI_BEGIN  0x30
-#define CP_WIFI_END    0x31
-#define CP_MQTT_BEGIN  0x40
-#define CP_MQTT_END    0x41
-#define CP_LCD_BEGIN   0x50
-#define CP_LCD_END     0x51
+#define CP_RELAY_END 0x21
+#define CP_WIFI_BEGIN 0x30
+#define CP_WIFI_END 0x31
+#define CP_MQTT_BEGIN 0x40
+#define CP_MQTT_END 0x41
+#define CP_LCD_BEGIN 0x50
+#define CP_LCD_END 0x51
 
 RTC_DATA_ATTR uint8_t lastCheckpoint = 0;
 RTC_DATA_ATTR uint32_t bootCount = 0;
@@ -40,20 +42,32 @@ RTC_DATA_ATTR uint32_t bootCount = 0;
 #define CRASH_LOG_PATH "/crash_log.txt"
 #define MAX_CRASH_LOG_ENTRIES 100
 
-static const char* checkpointName(uint8_t cp) {
+static const char *checkpointName(uint8_t cp) {
   switch (cp) {
-    case CP_LOOP_START:  return "LOOP_START";
-    case CP_TEMP_BEGIN:  return "TEMP_BEGIN";
-    case CP_TEMP_END:    return "TEMP_END";
-    case CP_RELAY_BEGIN: return "RELAY_BEGIN";
-    case CP_RELAY_END:   return "RELAY_END";
-    case CP_WIFI_BEGIN:  return "WIFI_BEGIN";
-    case CP_WIFI_END:    return "WIFI_END";
-    case CP_MQTT_BEGIN:  return "MQTT_BEGIN";
-    case CP_MQTT_END:    return "MQTT_END";
-    case CP_LCD_BEGIN:   return "LCD_BEGIN";
-    case CP_LCD_END:     return "LCD_END";
-    default:             return "UNKNOWN";
+  case CP_LOOP_START:
+    return "LOOP_START";
+  case CP_TEMP_BEGIN:
+    return "TEMP_BEGIN";
+  case CP_TEMP_END:
+    return "TEMP_END";
+  case CP_RELAY_BEGIN:
+    return "RELAY_BEGIN";
+  case CP_RELAY_END:
+    return "RELAY_END";
+  case CP_WIFI_BEGIN:
+    return "WIFI_BEGIN";
+  case CP_WIFI_END:
+    return "WIFI_END";
+  case CP_MQTT_BEGIN:
+    return "MQTT_BEGIN";
+  case CP_MQTT_END:
+    return "MQTT_END";
+  case CP_LCD_BEGIN:
+    return "LCD_BEGIN";
+  case CP_LCD_END:
+    return "LCD_END";
+  default:
+    return "UNKNOWN";
   }
 }
 
@@ -76,15 +90,18 @@ void setupSPIFFS() {
     if (f) {
       char entry[80];
       time_t now = time(NULL);
-      if (now > 1700000000) {  // NTP synced (after 2023)
-        struct tm* tmNow = localtime(&now);
-        snprintf(entry, sizeof(entry), "Boot#%lu CP=0x%02X(%s) %04d/%02d/%02d %02d:%02d:%02d\n",
-                 (unsigned long)bootCount, lastCheckpoint, checkpointName(lastCheckpoint),
-                 tmNow->tm_year + 1900, tmNow->tm_mon + 1, tmNow->tm_mday,
-                 tmNow->tm_hour, tmNow->tm_min, tmNow->tm_sec);
-      } else {  // NTP not yet synced
+      if (now > 1700000000) { // NTP synced (after 2023)
+        struct tm *tmNow = localtime(&now);
+        snprintf(entry, sizeof(entry),
+                 "Boot#%lu CP=0x%02X(%s) %04d/%02d/%02d %02d:%02d:%02d\n",
+                 (unsigned long)bootCount, lastCheckpoint,
+                 checkpointName(lastCheckpoint), tmNow->tm_year + 1900,
+                 tmNow->tm_mon + 1, tmNow->tm_mday, tmNow->tm_hour,
+                 tmNow->tm_min, tmNow->tm_sec);
+      } else { // NTP not yet synced
         snprintf(entry, sizeof(entry), "Boot#%lu CP=0x%02X(%s) (no NTP)\n",
-                 (unsigned long)bootCount, lastCheckpoint, checkpointName(lastCheckpoint));
+                 (unsigned long)bootCount, lastCheckpoint,
+                 checkpointName(lastCheckpoint));
       }
       f.print(entry);
       f.close();
@@ -95,7 +112,8 @@ void setupSPIFFS() {
     if (check) {
       int lines = 0;
       while (check.available()) {
-        if (check.read() == '\n') lines++;
+        if (check.read() == '\n')
+          lines++;
       }
       check.close();
       if (lines > MAX_CRASH_LOG_ENTRIES) {
@@ -125,20 +143,18 @@ void setupSPIFFS() {
 }
 
 // ===== WiFi (Non-blocking) =====
-const char* ssid = WIFI_SSID;
-const char* password = WIFI_PASSWORD;
+const char *ssid = WIFI_SSID;
+const char *password = WIFI_PASSWORD;
 
 enum WifiState { WIFI_IDLE, WIFI_CONNECTING };
 WifiState wifiState = WIFI_IDLE;
 unsigned long wifiConnectStartMs = 0;
-#define WIFI_CONNECT_TIMEOUT_MS 15000  // 15 seconds max per attempt
-#define WIFI_RETRY_INTERVAL_MS  30000  // wait 30s before retrying
+#define WIFI_CONNECT_TIMEOUT_MS 15000 // 15 seconds max per attempt
+#define WIFI_RETRY_INTERVAL_MS 30000  // wait 30s before retrying
 
 unsigned long wifiLastAttemptMs = 0;
 
-bool isWifiConnected() {
-  return WiFi.status() == WL_CONNECTED;
-}
+bool isWifiConnected() { return WiFi.status() == WL_CONNECTED; }
 
 // Non-blocking WiFi reconnection - call from loop()
 void handleWifiReconnect() {
@@ -150,30 +166,31 @@ void handleWifiReconnect() {
   unsigned long now = millis();
 
   switch (wifiState) {
-    case WIFI_IDLE:
-      if (now - wifiLastAttemptMs < WIFI_RETRY_INTERVAL_MS && wifiLastAttemptMs != 0) {
-        return; // too soon to retry
-      }
-      Serial.println("WiFi: starting reconnect...");
-      WiFi.disconnect();
-      WiFi.begin(ssid, password);
-      wifiConnectStartMs = now;
-      wifiLastAttemptMs = now;
-      wifiState = WIFI_CONNECTING;
-      break;
+  case WIFI_IDLE:
+    if (now - wifiLastAttemptMs < WIFI_RETRY_INTERVAL_MS &&
+        wifiLastAttemptMs != 0) {
+      return; // too soon to retry
+    }
+    Serial.println("WiFi: starting reconnect...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    wifiConnectStartMs = now;
+    wifiLastAttemptMs = now;
+    wifiState = WIFI_CONNECTING;
+    break;
 
-    case WIFI_CONNECTING:
-      if (isWifiConnected()) {
-        Serial.print("WiFi: connected, IP=");
-        Serial.println(WiFi.localIP());
-        configTime(TIMEZONE_JST, 0, "ntp.nict.jp", "ntp.jst.mfeed.ad.jp");
-        wifiState = WIFI_IDLE;
-      } else if (now - wifiConnectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
-        Serial.println("WiFi: connect timeout");
-        WiFi.disconnect();
-        wifiState = WIFI_IDLE;
-      }
-      break;
+  case WIFI_CONNECTING:
+    if (isWifiConnected()) {
+      Serial.print("WiFi: connected, IP=");
+      Serial.println(WiFi.localIP());
+      configTime(TIMEZONE_JST, 0, "ntp.nict.jp", "ntp.jst.mfeed.ad.jp");
+      wifiState = WIFI_IDLE;
+    } else if (now - wifiConnectStartMs > WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("WiFi: connect timeout");
+      WiFi.disconnect();
+      wifiState = WIFI_IDLE;
+    }
+    break;
   }
 }
 
@@ -197,8 +214,8 @@ void setupWifi() {
 }
 
 // ===== Temperature Sensors (Non-blocking) =====
-#include <OneWire.h>
 #include <DallasTemperature.h>
+#include <OneWire.h>
 
 #define ONE_WIRE_BUS 32
 OneWire oneWire(ONE_WIRE_BUS);
@@ -207,11 +224,16 @@ DallasTemperature tempSensors(&oneWire);
 int numberOfTempDevices = 0;
 float gCurrentTemp[MAX_TEMPDEVICES];
 
+// Stuck sensor detection: reinit OneWire if same value repeats too many times
+#define TEMP_STUCK_THRESHOLD 30 // ~5 minutes at 10s cycle
+int tempStuckCount[MAX_TEMPDEVICES] = {0};
+float tempPrevReading[MAX_TEMPDEVICES] = {0};
+
 // Non-blocking temperature state
 enum TempState { TEMP_IDLE, TEMP_CONVERTING };
 TempState tempState = TEMP_IDLE;
 unsigned long tempConvStartMs = 0;
-#define TEMP_CONVERSION_TIMEOUT_MS 2000  // 2 seconds max (normal is 750ms)
+#define TEMP_CONVERSION_TIMEOUT_MS 2000 // 2 seconds max (normal is 750ms)
 
 void setupTempSensor() {
   tempSensors.begin();
@@ -220,11 +242,28 @@ void setupTempSensor() {
   for (int i = 0; i < 10; i++) {
     numberOfTempDevices = tempSensors.getDeviceCount();
     Serial.printf("Temp sensor check: found %d devices\n", numberOfTempDevices);
-    if (numberOfTempDevices > 0) break;
+    if (numberOfTempDevices > 0)
+      break;
     delay(1000);
   }
   if (numberOfTempDevices > MAX_TEMPDEVICES) {
     numberOfTempDevices = MAX_TEMPDEVICES;
+  }
+}
+
+void reinitOneWire() {
+  Serial.println("WARN: Reinitializing OneWire bus (stuck sensor detected)");
+  tempState = TEMP_IDLE;
+  oneWire.reset();
+  tempSensors.begin();
+  tempSensors.setWaitForConversion(false);
+  numberOfTempDevices = tempSensors.getDeviceCount();
+  Serial.printf("OneWire reinit: found %d devices\n", numberOfTempDevices);
+  if (numberOfTempDevices > MAX_TEMPDEVICES) {
+    numberOfTempDevices = MAX_TEMPDEVICES;
+  }
+  for (int i = 0; i < MAX_TEMPDEVICES; i++) {
+    tempStuckCount[i] = 0;
   }
 }
 
@@ -239,19 +278,36 @@ void requestTempAsync() {
 
 // Check if conversion is done, read results. Returns true when data is ready.
 bool handleTempConversion() {
-  if (tempState != TEMP_CONVERTING) return false;
+  if (tempState != TEMP_CONVERTING)
+    return false;
 
   if (tempSensors.isConversionComplete() ||
       millis() - tempConvStartMs > TEMP_CONVERSION_TIMEOUT_MS) {
+    bool needsReinit = false;
     for (int i = 0; i < numberOfTempDevices; i++) {
       float temp = tempSensors.getTempCByIndex(i);
       if (temp != DEVICE_DISCONNECTED_C) {
+        // Stuck detection: count consecutive identical readings
+        if (temp == tempPrevReading[i]) {
+          tempStuckCount[i]++;
+          if (tempStuckCount[i] >= TEMP_STUCK_THRESHOLD) {
+            Serial.printf("WARN: Temp sensor %d stuck at %.2f for %d readings\n",
+                          i, temp, tempStuckCount[i]);
+            needsReinit = true;
+          }
+        } else {
+          tempStuckCount[i] = 0;
+        }
+        tempPrevReading[i] = temp;
         gCurrentTemp[i] = temp;
       } else {
         Serial.printf("Temp sensor %d: disconnected\n", i);
       }
     }
     tempState = TEMP_IDLE;
+    if (needsReinit) {
+      reinitOneWire();
+    }
     return true;
   }
   return false;
@@ -268,7 +324,7 @@ void gettingMoisture() {
   for (int i = 0; i < MAX_MOISTUREDEVICES; i++) {
     int raw = analogRead(portsForMoisture[i]);
     gCurrentMoisture[i] = constrain(
-      map(raw, AirMoistureValue, WaterMoistureValue, 0, 100), 0, 100);
+        map(raw, AirMoistureValue, WaterMoistureValue, 0, 100), 0, 100);
   }
 }
 
@@ -277,14 +333,40 @@ void gettingMoisture() {
 #define RELAY_A 0
 #define RELAY_B 1
 
-#define UPPER_TEMP_0 28.0
-#define LOWER_TEMP_0 27.5
-#define UPPER_TEMP_1 23.0
-#define LOWER_TEMP_1 22.5
+// 温度設定（ランタイム変数、Preferencesから読み込み）
+float upperTempSetting[2] = {30.0, 23.0}; // デフォルト値
 
 int portsForRelay[] = {18, 19};
-float upperTemp[] = {UPPER_TEMP_0, UPPER_TEMP_1};
-float lowerTemp[] = {LOWER_TEMP_0, LOWER_TEMP_1};
+float upperTemp[2];
+float lowerTemp[2];
+
+Preferences preferences;
+
+void updateTempThresholds() {
+  for (int i = 0; i < MAX_RELAYDEVICES; i++) {
+    upperTemp[i] = upperTempSetting[i];
+    lowerTemp[i] = upperTempSetting[i] - 1.5;
+  }
+}
+
+void loadTempSettings() {
+  preferences.begin("temp_cfg", true); // 読み取り専用
+  upperTempSetting[0] = preferences.getFloat("upper_temp_0", 30.0);
+  upperTempSetting[1] = preferences.getFloat("upper_temp_1", 23.0);
+  preferences.end();
+  updateTempThresholds();
+  Serial.printf("Temp settings loaded: T0=%.1f, T1=%.1f\n", upperTempSetting[0],
+                upperTempSetting[1]);
+}
+
+void saveTempSettings() {
+  preferences.begin("temp_cfg", false); // 読み書き
+  preferences.putFloat("upper_temp_0", upperTempSetting[0]);
+  preferences.putFloat("upper_temp_1", upperTempSetting[1]);
+  preferences.end();
+  Serial.printf("Temp settings saved: T0=%.1f, T1=%.1f\n", upperTempSetting[0],
+                upperTempSetting[1]);
+}
 
 #define LOWER_MOISTURE_0 20
 #define LOWER_MOISTURE_1 20
@@ -298,7 +380,7 @@ char gCurrentRelayState[] = {0, 0};
 void setupRelay() {
   for (int i = 0; i < MAX_RELAYDEVICES; i++) {
     pinMode(portsForRelay[i], OUTPUT);
-    digitalWrite(portsForRelay[i], LOW);  // Ensure known state at boot
+    digitalWrite(portsForRelay[i], LOW); // Ensure known state at boot
     gCurrentRelayState[i] = 0;
   }
 }
@@ -348,16 +430,16 @@ int mqttRetryCount = 0;
 
 AsyncWebServer server(80);
 
-const char* PARAM_RADIOGROUP_0 = "radiogroup0";
-const char* PARAM_RADIOGROUP_1 = "radiogroup1";
+const char *PARAM_RADIOGROUP_0 = "radiogroup0";
+const char *PARAM_RADIOGROUP_1 = "radiogroup1";
 
 const char index_html_template[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head>
   <title>Plant Temperature and Moisture Controller</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   </head><body>
-  Temperature 0: %TEMP_0%Celsius<p>
-  Temperature 1: %TEMP_1%Celsius<p>
+  Temperature 0: %TEMP_0%Celsius (Upper: %UPPER_TEMP_0%C)<p>
+  Temperature 1: %TEMP_1%Celsius (Upper: %UPPER_TEMP_1%C)<p>
   Moisture 0: %MOISTURE_0%<p>
   Moisture 1: %MOISTURE_1%<p>
   <form action="/get">
@@ -369,6 +451,24 @@ const char index_html_template[] PROGMEM = R"rawliteral(
     <input type="radio" name="radiogroup1" value="0" %HEATER_RADIO_ONE0%>Off(Default)
     <input type="radio" name="radiogroup1" value="1" %HEATER_RADIO_ONE1%>On
     <p>
+    Temp 0 Setting:
+    <select name="temp_setting_0">
+      <option value="22" %TEMP_SEL_0_22%>22C</option>
+      <option value="24" %TEMP_SEL_0_24%>24C</option>
+      <option value="26" %TEMP_SEL_0_26%>26C</option>
+      <option value="28" %TEMP_SEL_0_28%>28C</option>
+      <option value="30" %TEMP_SEL_0_30%>30C</option>
+      <option value="32" %TEMP_SEL_0_32%>32C</option>
+    </select><p>
+    Temp 1 Setting:
+    <select name="temp_setting_1">
+      <option value="22" %TEMP_SEL_1_22%>22C</option>
+      <option value="24" %TEMP_SEL_1_24%>24C</option>
+      <option value="26" %TEMP_SEL_1_26%>26C</option>
+      <option value="28" %TEMP_SEL_1_28%>28C</option>
+      <option value="30" %TEMP_SEL_1_30%>30C</option>
+      <option value="32" %TEMP_SEL_1_32%>32C</option>
+    </select><p>
     <input type="submit" value="Submit">
   </form>
   <hr>
@@ -382,16 +482,43 @@ void notFound(AsyncWebServerRequest *request) {
   request->send(404, "text/plain", "Not found");
 }
 
-String processor(const String& var) {
+String processor(const String &var) {
   char msgStr[MAX_MESSAGELENGTH];
 
-  if (var.substring(0, String("HEATER_RADIO_ZERO").length()) == "HEATER_RADIO_ZERO") {
-    int radioNumber = var.substring(String("HEATER_RADIO_ZERO").length()).toInt();
-    if (radioNumber == gCurrentRelayState[0]) return F("checked ");
+  if (var.substring(0, String("HEATER_RADIO_ZERO").length()) ==
+      "HEATER_RADIO_ZERO") {
+    int radioNumber =
+        var.substring(String("HEATER_RADIO_ZERO").length()).toInt();
+    if (radioNumber == gCurrentRelayState[0])
+      return F("checked ");
   }
-  if (var.substring(0, String("HEATER_RADIO_ONE").length()) == "HEATER_RADIO_ONE") {
-    int radioNumber = var.substring(String("HEATER_RADIO_ONE").length()).toInt();
-    if (radioNumber == gCurrentRelayState[1]) return F("checked ");
+  if (var.substring(0, String("HEATER_RADIO_ONE").length()) ==
+      "HEATER_RADIO_ONE") {
+    int radioNumber =
+        var.substring(String("HEATER_RADIO_ONE").length()).toInt();
+    if (radioNumber == gCurrentRelayState[1])
+      return F("checked ");
+  }
+  // 温度設定ドロップダウンの selected 属性
+  if (var.substring(0, String("TEMP_SEL_").length()) == "TEMP_SEL_") {
+    // TEMP_SEL_0_22, TEMP_SEL_1_30 など
+    String rest = var.substring(String("TEMP_SEL_").length());
+    int sensorIdx = rest.substring(0, 1).toInt();
+    int optionVal = rest.substring(2).toInt();
+    if (sensorIdx >= 0 && sensorIdx < 2 &&
+        (int)upperTempSetting[sensorIdx] == optionVal) {
+      return F("selected");
+    }
+    return String();
+  }
+  // 現在の上限温度設定値の表示
+  if (var == "UPPER_TEMP_0") {
+    sprintf(msgStr, "%.0f", upperTempSetting[0]);
+    return String(msgStr);
+  }
+  if (var == "UPPER_TEMP_1") {
+    sprintf(msgStr, "%.0f", upperTempSetting[1]);
+    return String(msgStr);
   }
   if (var.substring(0, String("TEMP_").length()) == "TEMP_") {
     int itemNo = var.substring(String("TEMP_").length()).toInt();
@@ -445,15 +572,37 @@ void setupWebServer() {
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request) {
     boolean processed = false;
     if (request->hasParam(PARAM_RADIOGROUP_0)) {
-      relayControl(RELAY_A, request->getParam(PARAM_RADIOGROUP_0)->value().toInt());
+      relayControl(RELAY_A,
+                   request->getParam(PARAM_RADIOGROUP_0)->value().toInt());
       processed = true;
     }
     if (request->hasParam(PARAM_RADIOGROUP_1)) {
-      relayControl(RELAY_B, request->getParam(PARAM_RADIOGROUP_1)->value().toInt());
+      relayControl(RELAY_B,
+                   request->getParam(PARAM_RADIOGROUP_1)->value().toInt());
       processed = true;
     }
+    // 温度設定の処理
+    if (request->hasParam("temp_setting_0")) {
+      float val = request->getParam("temp_setting_0")->value().toFloat();
+      if (val >= 22.0 && val <= 32.0) {
+        upperTempSetting[0] = val;
+        processed = true;
+      }
+    }
+    if (request->hasParam("temp_setting_1")) {
+      float val = request->getParam("temp_setting_1")->value().toFloat();
+      if (val >= 22.0 && val <= 32.0) {
+        upperTempSetting[1] = val;
+        processed = true;
+      }
+    }
+    if (processed) {
+      updateTempThresholds();
+      saveTempSettings();
+    }
     request->send(200, "text/html",
-      "HTTP GET request sent to your ESP<br><a href=\"/\">Return to Home Page</a>");
+                  "HTTP GET request sent to your ESP<br><a href=\"/\">Return "
+                  "to Home Page</a>");
   });
 
   // Crash log endpoint
@@ -470,13 +619,13 @@ void setupWebServer() {
 }
 
 // ===== MQTT (Non-blocking) =====
-const char* mqtt_server = MQTT_SERVER;
+const char *mqtt_server = MQTT_SERVER;
 const char mqttClientName[] = MQTT_CLIENT_NAME;
 const char mqtt_topic[] = MQTT_TOPIC;
 
 void setupMQTT() {
   mqttClient.setServer(mqtt_server, 1883);
-  mqttClient.setSocketTimeout(5);  // 5 seconds max for TCP connect (default 15)
+  mqttClient.setSocketTimeout(5); // 5 seconds max for TCP connect (default 15)
 }
 
 void publishMQTTmessage(const char *theTopic, char *theMessage) {
@@ -487,8 +636,8 @@ void publishMQTTmessage(const char *theTopic, char *theMessage) {
 
 String ipToString(uint32_t ip) {
   char buf[16];
-  snprintf(buf, sizeof(buf), "%d.%d.%d.%d",
-           ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
+  snprintf(buf, sizeof(buf), "%d.%d.%d.%d", ip & 0xFF, (ip >> 8) & 0xFF,
+           (ip >> 16) & 0xFF, (ip >> 24) & 0xFF);
   return String(buf);
 }
 
@@ -498,10 +647,12 @@ bool handleMqttReconnect() {
     mqttRetryCount = 0;
     return true;
   }
-  if (!isWifiConnected()) return false;
+  if (!isWifiConnected())
+    return false;
 
   unsigned long now = millis();
-  if (now - mqttLastAttemptMs < MQTT_RETRY_INTERVAL_MS && mqttLastAttemptMs != 0) {
+  if (now - mqttLastAttemptMs < MQTT_RETRY_INTERVAL_MS &&
+      mqttLastAttemptMs != 0) {
     return false;
   }
 
@@ -513,7 +664,8 @@ bool handleMqttReconnect() {
     return false;
   }
 
-  Serial.printf("MQTT: connect attempt %d/%d...\n", mqttRetryCount + 1, MQTT_MAX_RETRIES);
+  Serial.printf("MQTT: connect attempt %d/%d...\n", mqttRetryCount + 1,
+                MQTT_MAX_RETRIES);
   mqttLastAttemptMs = now;
   mqttRetryCount++;
 
@@ -532,7 +684,8 @@ bool handleMqttReconnect() {
 }
 
 void loggingAtMQTT() {
-  if (!mqttClient.connected()) return;
+  if (!mqttClient.connected())
+    return;
 
   mqttClient.loop();
 
@@ -541,7 +694,7 @@ void loggingAtMQTT() {
 
   // DateTime
   time_t unixTime = time(NULL);
-  struct tm* tmNow = localtime(&unixTime);
+  struct tm *tmNow = localtime(&unixTime);
   snprintf(msgStr, sizeof(msgStr), "%04d/%02d/%02d %02d:%02d:%02d",
            tmNow->tm_year + 1900, tmNow->tm_mon + 1, tmNow->tm_mday,
            tmNow->tm_hour, tmNow->tm_min, tmNow->tm_sec);
@@ -564,14 +717,15 @@ void loggingAtMQTT() {
   // Relay state
   for (int i = 0; i < MAX_RELAYDEVICES; i++) {
     snprintf(topicStr, sizeof(topicStr), "Relay/%d", i);
-    snprintf(msgStr, sizeof(msgStr), "%s", (gCurrentRelayState[i] ? "ON" : "OFF"));
+    snprintf(msgStr, sizeof(msgStr), "%s",
+             (gCurrentRelayState[i] ? "ON" : "OFF"));
     publishMQTTmessage(topicStr, msgStr);
   }
 }
 
 // ===== LCD =====
-#include <Wire.h>
 #include <ST7032.h>
+#include <Wire.h>
 
 #define MAX_MESSAGELINES 2
 ST7032 lcd;
@@ -588,8 +742,8 @@ void setupLCD(const char *whoAreYou) {
 void displayLCD(char stateChar) {
   char msgStr[MAX_MESSAGELENGTH];
   for (int i = 0; i < MAX_MESSAGELINES; i++) {
-    snprintf(msgStr, sizeof(msgStr), "%2.2fC%c %2d%%%c%-3s ",
-             gCurrentTemp[i], 0xdf, gCurrentMoisture[i], stateChar,
+    snprintf(msgStr, sizeof(msgStr), "%2.2fC%c %2d%%%c%-3s ", gCurrentTemp[i],
+             0xdf, gCurrentMoisture[i], stateChar,
              (gCurrentRelayState[i] ? "ON" : "OFF"));
     lcd.setCursor(0, i);
     lcd.print(msgStr);
@@ -599,38 +753,50 @@ void displayLCD(char stateChar) {
 // ===== OTA Update =====
 #include <AsyncElegantOTA.h>
 
-void setupOTAupdate() {
-  AsyncElegantOTA.begin(&server);
-}
+void setupOTAupdate() { AsyncElegantOTA.begin(&server); }
 
 // ===== Watchdog Timer =====
-#define WDT_TIMEOUT_SEC 30  // Reset if stuck for 30 seconds
+#define WDT_TIMEOUT_SEC 30 // Reset if stuck for 30 seconds
 
 void setupWatchdog() {
-  esp_task_wdt_init(WDT_TIMEOUT_SEC, true);  // true = trigger reset on timeout
-  esp_task_wdt_add(NULL);  // Add current task (loopTask)
+  esp_task_wdt_init(WDT_TIMEOUT_SEC, true); // true = trigger reset on timeout
+  esp_task_wdt_add(NULL);                   // Add current task (loopTask)
   Serial.printf("WDT: configured for %d seconds\n", WDT_TIMEOUT_SEC);
 }
 
 // ===== Main Loop Timing =====
-#define LOOP_INTERVAL_MS 10000  // 10 seconds main cycle
+#define LOOP_INTERVAL_MS 10000 // 10 seconds main cycle
 
 unsigned long lastLoopMs = 0;
 
 // ===== Setup =====
 void setup() {
   Serial.begin(115200);
-  Serial.printf("\n=== Boot #%lu, last CP=0x%02X ===\n", (unsigned long)bootCount, lastCheckpoint);
+  Serial.printf("\n=== Boot #%lu, last CP=0x%02X ===\n",
+                (unsigned long)bootCount, lastCheckpoint);
 
   setupSPIFFS();
   setupLCD(mqtt_topic);
 
-  lcd.setCursor(0, 0); lcd.print("WiFi setup      "); setupWifi();
-  lcd.setCursor(0, 0); lcd.print("OTA setup       "); setupOTAupdate();
-  lcd.setCursor(0, 0); lcd.print("Temp setup      "); setupTempSensor();
-  lcd.setCursor(0, 0); lcd.print("Relay setup     "); setupRelay();
-  lcd.setCursor(0, 0); lcd.print("WebServer setup "); setupWebServer();
-  lcd.setCursor(0, 0); lcd.print("MQTT setup      "); setupMQTT();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi setup      ");
+  setupWifi();
+  lcd.setCursor(0, 0);
+  lcd.print("OTA setup       ");
+  setupOTAupdate();
+  lcd.setCursor(0, 0);
+  lcd.print("Temp setup      ");
+  setupTempSensor();
+  loadTempSettings();
+  lcd.setCursor(0, 0);
+  lcd.print("Relay setup     ");
+  setupRelay();
+  lcd.setCursor(0, 0);
+  lcd.print("WebServer setup ");
+  setupWebServer();
+  lcd.setCursor(0, 0);
+  lcd.print("MQTT setup      ");
+  setupMQTT();
 
   setupWatchdog();
 
@@ -643,7 +809,7 @@ void setup() {
 
 // ===== Loop (millis-based, non-blocking) =====
 void loop() {
-  esp_task_wdt_reset();  // Feed watchdog every loop iteration
+  esp_task_wdt_reset(); // Feed watchdog every loop iteration
 
   unsigned long now = millis();
 
